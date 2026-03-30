@@ -29,9 +29,11 @@ def insert_key(key, exp):
         (key, exp)
     )
     conn.commit()
+    kid = cursor.lastrowid #get auto-generated kid
     conn.close()
+    return kid
 
-def load_key(expired=False):
+def load_key(expired=False, return_kid=False):
     conn = connect_db()
     cursor = conn.cursor()
 
@@ -40,18 +42,34 @@ def load_key(expired=False):
     #load a key from the DB
     if expired:
         cursor.execute(
-            "SELECT key FROM keys WHERE exp <= ? ORDER BY exp DESC LIMIT 1",
+            "SELECT kid, key FROM keys WHERE exp <= ? ORDER BY exp DESC LIMIT 1",
             (now,)
         )
     else:
         cursor.execute(
-            "SELECT key FROM keys WHERE exp > ? ORDER BY exp ASC LIMIT 1",
+            "SELECT kid, key FROM keys WHERE exp > ? ORDER BY exp ASC LIMIT 1",
             (now,)
         )
 
     row = cursor.fetchone()
     conn.close()
     if row:
-        return row[0]  # this is bytes (BLOB)
-    return None
-    #cursor.execute("SELECT key_value FROM keys WHERE ___")
+        if return_kid:
+            return row[1], row[0]  #kid and key blob
+        return row[1]  # just key blob
+    return (None, None) if return_kid else None
+
+def get_valid_keys():
+    conn = connect_db()
+    cursor = conn.cursor()
+
+    now = int(datetime.datetime.utcnow().timestamp())
+
+    cursor.execute(
+        "SELECT kid, key FROM keys WHERE exp > ? ORDER BY exp ASC",
+        (now,)
+    )
+    rows = cursor.fetchall()
+
+    conn.close()
+    return rows
