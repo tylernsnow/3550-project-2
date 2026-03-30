@@ -7,7 +7,7 @@ import json
 import jwt
 import datetime
 #db.py functions:
-from db import init_db, insert_key, load_key
+from db import init_db, insert_key, load_key, get_valid_keys
 
 #This will be used in main to host at localhost:8080
 hostName = "localhost"
@@ -86,39 +86,46 @@ class MyServer(BaseHTTPRequestHandler):
         params = parse_qs(parsed_path.query)
         is_expired = 'expired' in params
         if parsed_path.path == "/auth":
-            headers = {
-                #"kid": "goodKID"
-            }
             token_payload = {
                 "user": "username",
                 "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=1)
             }
             if is_expired:
-                headers["kid"] = "expiredKID"
                 token_payload["exp"] = datetime.datetime.utcnow() - datetime.timedelta(hours=1)
-            stored_pem = load_key(expired='is_expired') #load an expired key
+            try:
+                stored_pem, kid = load_key(expired=is_expired, return_kid=True) #load an expired key
+                headers = {"kid": str(kid)}
+                if stored_pem is None:
+                    self.send_response(500)
+                    self.end_headers()
+                    self.wfile.write("No key available".encode("utf-8"))
+                    return
             
-            if stored_pem is None:
-                self.send_response(500)
-                self.end_headers
-                self.wfile.write("No key available")
-                return
-            
-            loaded_key = serialization.load_pem_private_key(   #convert pem to usable format 
-                stored_pem,
-                password=None
-            )
-            headers["kid"] = "goodKID" #replace w/ auto-increment kid system in DB
-            #Sign JWT with private key:
-            encoded_jwt = jwt.encode(token_payload, loaded_key, algorithm="RS256", headers=headers)
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(bytes(encoded_jwt, "utf-8"))
-            return
+                loaded_key = serialization.load_pem_private_key(   #convert pem to usable format 
+                    stored_pem,
+                    password=None
+                )
+                #headers["kid"] = "goodKID" #replace w/ auto-increment kid system in DB
+                #Sign JWT with private key:
+                encoded_jwt = jwt.encode(token_payload, loaded_key, algorithm="RS256", headers=headers)
+                #wrap JWT in json for gradebot:
+                encoded_jwt_str = encoded_jwt if isinstance(encoded_jwt, str) else encoded_jwt.decode("utf-8")
+                response = json.dumps({"jwt": encoded_jwt_str}).encode("utf-8")
 
-        self.send_response(405)
-        self.end_headers()
-        return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(response)))
+                self.end_headers()
+                #self.wfile.write(bytes(encoded_jwt, "utf-8"))
+                self.wfile.write(response)
+                return
+
+            except Exception as e:
+                print("Error in do_POST:", e)
+                self.send_response(500)
+                self.end_headers()
+                self.wfile.write(b"Internal server error")
+                return
 
     #read non-expired private keys
     def do_GET(self):
@@ -126,20 +133,36 @@ class MyServer(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-type", "application/json")
             self.end_headers()
-            #call function to fetch all keys where exp > now
+
             #store list of keys, each should include kid, key_blob
             keys = {
-                "keys": [
-                    {
-                        "alg": "RS256",
-                        "kty": "RSA",
-                        "use": "sig",
-                        "kid": "goodKID",
-                        "n": int_to_base64(numbers.public_numbers.n),
-                        "e": int_to_base64(numbers.public_numbers.e),
-                    }
-                ]
+                "keys": []
             }
+            #call function to fetch all keys where exp > now
+            valid_keys = get_valid_keys()
+            for kid, key_blob in valid_keys:
+                private_key = serialization.load_pem_private_key(
+                    key_blob,
+                    password=None
+                )
+                #get public key:
+                public_key = private_key.public_key()
+                #extract numbers:
+                numbers = public_key.public_numbers()
+                #convert to base64URL
+                n_b64 = int_to_base64(numbers.n)
+                e_b64 = int_to_base64(numbers.e)
+
+                #Build JWK
+                jwk = {
+                    "alg": "RS256",
+                    "kty": "RSA",
+                    "use": "sig",
+                    "kid": str(kid),
+                    "n": n_b64,
+                    "e": e_b64
+                }
+                keys["keys"].append(jwk)
             self.wfile.write(bytes(json.dumps(keys), "utf-8"))
             return
 
@@ -154,9 +177,10 @@ if __name__ == "__main__":
     #FIXME: put these in a function
     now = int(datetime.datetime.utcnow().timestamp())
     one_hour = now + 3600
+    #expired = now - 3600
 
-    insert_key(pem, one_hour)        # valid key, expires in 1 hour
-    insert_key(expired_pem, now)    # expired key, expires now
+    valid_kid = insert_key(pem, one_hour)        # valid key, expires in 1 hour. These return the
+    expired_kid = insert_key(expired_pem, now)    # expired key, expires now
 
     webServer = HTTPServer((hostName, serverPort), MyServer)
     try:
